@@ -22,7 +22,8 @@ concurrency:
 
 jobs:
   ipa:
-    runs-on: macos-15
+    # Intel: the iPad build cross-compiles, and this pool has capacity when the arm64 one doesn't.
+    runs-on: macos-15-intel
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
