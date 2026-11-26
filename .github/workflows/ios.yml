@@ -25,7 +25,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Read the craft-i18n revision
         id: i18n
@@ -36,7 +36,7 @@ jobs:
       - name: Check out craft-i18n
         id: i18n-checkout
         continue-on-error: true
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: storytold/craft-i18n
           ref: ${{ steps.i18n.outputs.rev }}
@@ -47,7 +47,7 @@ jobs:
       - name: Check out craft-fonts
         id: fonts-checkout
         continue-on-error: true
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: storytold/craft-fonts
           ref: b076417b5880bd4154bd22f00695b1d28c6bea83
