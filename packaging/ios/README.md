@@ -43,28 +43,37 @@ Then, on the iPad:
 
 ## Using it
 
-- **Files.** Documents live in the app's Documents folder, which the Files app shows as
-  **On My iPad › WordCraft**. Copy files there to open them in WordCraft; files you save there
-  appear in Files. File › Open and Save As use WordCraft's own file browser and start in that
-  folder.
+- **Files.** File › Open, Save As and Export use the iPad's own document picker, so you can open
+  and save anywhere the Files app reaches: On My iPad, iCloud Drive and other providers. A
+  document opened from somewhere else is edited where it is, and Save writes back to it. Save As
+  asks where to put the file; if the name is taken, the picker asks whether to replace it.
+- **Open in WordCraft.** WordCraft is listed for Word documents and templates (.docx, .doc,
+  .dotx), OpenDocument text, RTF, Markdown, HTML and plain text. In the Files app, touch and hold
+  a document and choose **Share › WordCraft** (or **Open With**); other apps' share sheets offer
+  it too.
 - **Keyboard.** Typing, Return, Tab, Delete, the arrow keys (with Shift, Option and Command), Page
-  Up/Down, and Command and Control shortcuts all work, and held keys repeat. The on-screen
-  keyboard appears only when WordCraft asks for text input and no hardware keyboard is attached.
+  Up/Down, and Command and Control shortcuts all work, and held keys repeat.
+- **On-screen keyboard.** It appears when you tap into the text (the document, or a text box in a
+  dialog), not when you tap a button or scroll, and never while a hardware keyboard is attached.
+  Its dismiss key hides it until you tap into text again.
 - **Trackpad.** The pointer hovers over controls, a click is a mouse click, a two-finger click
   opens the context menu, and two-finger scrolling scrolls, with momentum.
-- **Touch** works too: tap to place the caret and press buttons.
+- **Touch.** Tap to place the caret or press a button; double-tap selects a word. Drag with one
+  finger to scroll (it glides on when you let go). Touch and hold, then drag, to select text.
+  Pinch with two fingers to zoom. Apple Pencil selects as it moves, like a mouse.
 - **Clipboard.** Copy and paste go through the iPad's clipboard: plain text, HTML, RTF and
   pictures, to and from other apps. iPadOS may ask you to allow pasting from another app.
 - **Multitasking.** Split View, Slide Over and Stage Manager resize the window.
 
 ## Known limits
 
-- No native file picker yet: files outside WordCraft's folder (iCloud Drive, other apps) have to
-  be copied into **On My iPad › WordCraft** first, and "Open in WordCraft" from other apps isn't
-  offered.
+- Save As can't rename in the picker: the file gets the document's name, and you can rename it in
+  the Files app.
+- A document opened from another provider is rewritten in place on Save (a copy of its previous
+  version is kept in WordCraft's temporary folder until the save succeeds); iPadOS doesn't let
+  the app put a temporary file beside it.
 - Printing doesn't reach AirPrint. Export to PDF and print the PDF from Files.
 - The pointer keeps its round iPadOS shape; it doesn't turn into an I-beam over text.
-- Pinch to zoom isn't wired up; use the zoom slider or View › Zoom.
 - Messages the desktop app shows in a system dialog box (rare; for example, a failed start) only
   go to the log on iPad.
 - No self-update: install a newer IPA the same way.
@@ -74,10 +83,12 @@ Then, on the iPad:
 `prepare-sources.sh` fetches two dependencies and patches them for iPadOS (`patches/`):
 
 - **winit** (storytold/winit at the workspace's pinned rev): hardware keyboard key events with
-  modifiers and repeat (UIKit presses), trackpad hover, two-finger scroll with momentum, trackpad
-  clicks as mouse buttons, and an empty input view so the on-screen keyboard shows only for text
-  input.
-- **rfd** 0.17.2: an iOS backend with no native dialogs, so the app uses its own file chooser.
+  modifiers and repeat (UIKit presses); trackpad hover, two-finger scroll with momentum and clicks
+  as mouse buttons; finger taps, one-finger scrolling, press-and-drag and pinch; the on-screen
+  keyboard only after a tap at the caret; and an app delegate that hands documents opened from
+  other apps to the window as dropped files.
+- **rfd** 0.17.2: an iOS backend on UIKit's document picker (open in place, export for Save As,
+  folders).
 
 The app itself uses UIPasteboard for the clipboard (`apps/wordcraft/src/ios.rs`, through
 `crates/ios-pasteboard`), keeps its settings in `Library/Application Support/WordCraft` inside

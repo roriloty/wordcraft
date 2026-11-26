@@ -89,6 +89,55 @@
   <true/>
   <key>LSSupportsOpeningDocumentsInPlace</key>
   <true/>
+  <!-- The documents WordCraft opens: it is offered in the Files app's Open With and Share
+       menus and in other apps' share sheets, and opens them in place. -->
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>Word Document</string>
+      <key>CFBundleTypeRole</key>
+      <string>Editor</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>org.openxmlformats.wordprocessingml.document</string>
+        <string>org.openxmlformats.wordprocessingml.document.macroenabled</string>
+        <string>com.microsoft.word.doc</string>
+      </array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>Word Template</string>
+      <key>CFBundleTypeRole</key>
+      <string>Editor</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>org.openxmlformats.wordprocessingml.template</string>
+        <string>org.openxmlformats.wordprocessingml.template.macroenabled</string>
+        <string>com.microsoft.word.dot</string>
+      </array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>Text Document</string>
+      <key>CFBundleTypeRole</key>
+      <string>Editor</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>org.oasis-open.opendocument.text</string>
+        <string>public.rtf</string>
+        <string>net.daringfireball.markdown</string>
+        <string>public.html</string>
+        <string>public.plain-text</string>
+      </array>
+    </dict>
+  </array>
   <key>ITSAppUsesNonExemptEncryption</key>
   <false/>
   <key>LSApplicationCategoryType</key>

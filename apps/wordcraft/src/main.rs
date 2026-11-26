@@ -699,9 +699,7 @@ fn main() -> eframe::Result {
             let mut app = WordApp::new(session, services(spool.clone(), intake, nightly)).with_host(host).with_settings(settings.clone());
             // PLAN: writer note 9 puts `with_settings` after `with_control`; it comes first here because
             // the region check below reads the saved region the settings apply.
-            // iPadOS has no file panel a running app can block on: the built-in chooser browses the
-            // app's Documents folder, which the Files app shares.
-            if cfg!(target_os = "ios") || std::env::var("WORDCRAFT_FILE_DIALOG").is_ok_and(|v| v.trim().eq_ignore_ascii_case("builtin")) {
+            if std::env::var("WORDCRAFT_FILE_DIALOG").is_ok_and(|v| v.trim().eq_ignore_ascii_case("builtin")) {
                 app = app.with_fallback_chooser(true);
             }
             if nightly {

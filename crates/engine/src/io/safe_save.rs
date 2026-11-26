@@ -112,9 +112,17 @@ fn replace_with(path: &Path, private: bool, prepare: impl FnOnce(&mut File) -> i
 /// fails. Anything already at `path` is left untouched: overwriting it in place could destroy the
 /// only copy, so the error says how to save safely instead.
 fn create_directly(path: &Path, refused: io::Error, prepare: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
+    // iPadOS rewrites an existing file instead of explaining why it can't.
+    #[cfg(target_os = "ios")]
+    let _ = &refused;
     // `create_new` never opens an existing file or follows a link, so it can't touch one.
     let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(file) => file,
+        // iPadOS gives access to the one document picked in the Files picker or opened from
+        // another app, never to its folder: a save there can only rewrite the file itself.
+        #[cfg(target_os = "ios")]
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return rewrite_in_place(path, prepare),
+        #[cfg(not(target_os = "ios"))]
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
             return Err(guided(
                 refused,
@@ -131,6 +139,32 @@ fn create_directly(path: &Path, refused: io::Error, prepare: impl FnOnce(&mut Fi
     match fs::remove_file(path) {
         Ok(()) => Err(failed),
         Err(e) => Err(io::Error::new(failed.kind(), format!("{failed}; removing the incomplete new file also failed ({e})"))),
+    }
+}
+
+/// iPadOS: rewrites the existing `path` in place, as nothing may be created beside it. Its
+/// previous bytes are copied to the app's own temporary folder first and put back if the write
+/// fails, so a failed save still leaves the document as it was.
+#[cfg(target_os = "ios")]
+fn rewrite_in_place(path: &Path, prepare: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let backup = std::env::temp_dir().join(format!("wordcraft-previous-{}-{id}", std::process::id()));
+    fs::copy(path, &backup)?;
+    let written = OpenOptions::new().write(true).truncate(true).open(path).and_then(|mut file| prepare(&mut file));
+    let Err(failed) = written else {
+        let _ = fs::remove_file(&backup);
+        return Ok(());
+    };
+    match fs::copy(&backup, path) {
+        Ok(_) => {
+            let _ = fs::remove_file(&backup);
+            Err(failed)
+        }
+        Err(e) => Err(io::Error::new(
+            failed.kind(),
+            format!("{failed}; putting the previous version back also failed ({e}), so it is kept at {}", backup.display()),
+        )),
     }
 }
 

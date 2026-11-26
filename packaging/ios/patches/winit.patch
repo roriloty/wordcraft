@@ -1,18 +1,19 @@
 diff --git a/Cargo.toml b/Cargo.toml
-index 72be2b0..6997c4b 100644
+index 72be2b0..a0dc937 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -193,6 +193,9 @@ features = [
+@@ -193,6 +193,10 @@ features = [
      "NSProcessInfo",
      "NSThread",
      "NSSet",
 +    "NSDate",
 +    "NSTimer",
 +    "NSValue",
++    "NSURL",
  ]
  
  [target.'cfg(target_os = "ios")'.dependencies.objc2-ui-kit]
-@@ -203,6 +206,12 @@ features = [
+@@ -203,6 +207,12 @@ features = [
      "UIEvent",
      "UIGeometry",
      "UIGestureRecognizer",
@@ -25,6 +26,94 @@ index 72be2b0..6997c4b 100644
      "UITextInput",
      "UITextInputTraits",
      "UIOrientation",
+diff --git a/src/platform_impl/ios/event_loop.rs b/src/platform_impl/ios/event_loop.rs
+index a093b7b..49cfa25 100644
+--- a/src/platform_impl/ios/event_loop.rs
++++ b/src/platform_impl/ios/event_loop.rs
+@@ -12,8 +12,9 @@ use core_foundation::runloop::{
+     CFRunLoopSourceInvalidate, CFRunLoopSourceRef, CFRunLoopSourceSignal, CFRunLoopWakeUp,
+ };
+ use objc2::rc::Retained;
+-use objc2::{msg_send_id, ClassType};
+-use objc2_foundation::{MainThreadMarker, NSNotificationCenter, NSObject};
++use objc2::runtime::NSObjectProtocol;
++use objc2::{declare_class, msg_send_id, mutability, ClassType, DeclaredClass};
++use objc2_foundation::{MainThreadMarker, NSNotificationCenter, NSObject, NSString, NSURL};
+ use objc2_ui_kit::{
+     UIApplication, UIApplicationDidBecomeActiveNotification,
+     UIApplicationDidEnterBackgroundNotification, UIApplicationDidFinishLaunchingNotification,
+@@ -302,14 +303,15 @@ impl<T: 'static> EventLoop<T> {
+             fn _NSGetArgv() -> *mut *mut *mut c_char;
+         }
+ 
++        // The app delegate: it receives the documents other apps and the Files app open here.
++        let delegate_class = NSString::from_str(WinitApplicationDelegate::NAME);
++        let _ = WinitApplicationDelegate::class();
+         unsafe {
+             UIApplicationMain(
+                 *_NSGetArgc(),
+                 NonNull::new(*_NSGetArgv()).unwrap(),
+-                // We intentionally override neither the application nor the delegate, to allow the
+-                // user to do so themselves!
+-                None,
+                 None,
++                Some(&delegate_class),
+             )
+         };
+         unreachable!()
+@@ -492,3 +494,52 @@ fn setup_control_flow_observers() {
+         CFRunLoopAddObserver(main_loop, end_observer, kCFRunLoopDefaultMode);
+     }
+ }
++
++declare_class!(
++    /// Opens the documents handed to the app: from the Files app ("Open in", or a document whose
++    /// type the app lists) or another app's share sheet. Each becomes a `DroppedFile` event.
++    pub(crate) struct WinitApplicationDelegate;
++
++    unsafe impl ClassType for WinitApplicationDelegate {
++        type Super = NSObject;
++        type Mutability = mutability::MainThreadOnly;
++        const NAME: &'static str = "WinitApplicationDelegate";
++    }
++
++    impl DeclaredClass for WinitApplicationDelegate {}
++
++    unsafe impl WinitApplicationDelegate {
++        #[method(application:didFinishLaunchingWithOptions:)]
++        fn did_finish_launching(&self, _application: &UIApplication, _options: Option<&NSObject>) -> bool {
++            true
++        }
++
++        #[method(application:openURL:options:)]
++        fn open_url(&self, application: &UIApplication, url: &NSURL, _options: Option<&NSObject>) -> bool {
++            open_file_url(application, url)
++        }
++    }
++);
++
++unsafe impl NSObjectProtocol for WinitApplicationDelegate {}
++
++/// Queues the file at `url` for the window to open; false for a URL that isn't a file.
++fn open_file_url(application: &UIApplication, url: &NSURL) -> bool {
++    if !unsafe { url.isFileURL() } {
++        return false;
++    }
++    // In place (the Files app) or a copy in Documents/Inbox (another app's share sheet): either
++    // way the app may read it now and save to it later.
++    let _ = unsafe { url.startAccessingSecurityScopedResource() };
++    let Some(path) = (unsafe { url.path() }) else { return false };
++    super::push_opened_file(std::path::PathBuf::from(path.to_string()));
++    // Wake the window, which hands the file over on its next draw.
++    #[allow(deprecated)]
++    let windows = application.windows();
++    for window in windows.iter() {
++        if let Some(view) = window.rootViewController().and_then(|vc| vc.view()) {
++            view.setNeedsDisplay();
++        }
++    }
++    true
++}
 diff --git a/src/platform_impl/ios/input.rs b/src/platform_impl/ios/input.rs
 new file mode 100644
 index 0000000..057a318
@@ -322,7 +411,7 @@ index 0000000..057a318
 +    })
 +}
 diff --git a/src/platform_impl/ios/mod.rs b/src/platform_impl/ios/mod.rs
-index 69e79c9..40bce19 100644
+index 69e79c9..7896721 100644
 --- a/src/platform_impl/ios/mod.rs
 +++ b/src/platform_impl/ios/mod.rs
 @@ -1,6 +1,7 @@
@@ -333,8 +422,26 @@ index 69e79c9..40bce19 100644
  mod event_loop;
  mod monitor;
  mod notification_center;
+@@ -50,3 +51,17 @@ impl fmt::Display for OsError {
+         write!(f, "os error")
+     }
+ }
++
++/// Documents another app or the Files app asked this app to open (`application:openURL:options:`),
++/// waiting for the window to hand them over as dropped files.
++static OPENED_FILES: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
++
++pub(crate) fn push_opened_file(path: std::path::PathBuf) {
++    if let Ok(mut files) = OPENED_FILES.lock() {
++        files.push(path);
++    }
++}
++
++pub(crate) fn take_opened_files() -> Vec<std::path::PathBuf> {
++    OPENED_FILES.lock().map(|mut files| std::mem::take(&mut *files)).unwrap_or_default()
++}
 diff --git a/src/platform_impl/ios/view.rs b/src/platform_impl/ios/view.rs
-index 418968c..e6ec22d 100644
+index 418968c..fd95139 100644
 --- a/src/platform_impl/ios/view.rs
 +++ b/src/platform_impl/ios/view.rs
 @@ -1,22 +1,35 @@
@@ -381,7 +488,7 @@ index 418968c..e6ec22d 100644
  use crate::platform_impl::platform::DEVICE_ID;
  use crate::platform_impl::KeyEventExtra;
  use crate::window::{WindowAttributes, WindowId as RootWindowId};
-@@ -31,8 +44,42 @@ pub struct WinitViewState {
+@@ -31,8 +44,91 @@ pub struct WinitViewState {
      rotation_last_delta: Cell<CGFloat>,
      pinch_last_delta: Cell<CGFloat>,
      pan_last_delta: Cell<CGPoint>,
@@ -408,8 +515,57 @@ index 418968c..e6ec22d 100644
 +    // isn't wanted, an empty input view keeps the on-screen keyboard away.
 +    ime_allowed: Cell<bool>,
 +    empty_input_view: RefCell<Option<Retained<UIView>>>,
++
++    // The on-screen keyboard: shown only after a finger tap lands at the caret of a text the app
++    // is editing (the caret area it reports), not whenever text input is on.
++    soft_keyboard: Cell<bool>,
++    ime_caret: Cell<Option<CGRect>>,
++    last_tap: Cell<Option<CGPoint>>,
++    keyboard_check: RefCell<Option<Retained<NSTimer>>>,
++
++    // Fingers on the screen: one finger taps (a click), drags to scroll, or after a long press
++    // drags with the button down (selects); two fingers pinch.
++    finger: RefCell<Option<Finger>>,
++    fingers_down: RefCell<Vec<u64>>,
++    long_press: RefCell<Option<Retained<NSTimer>>>,
++    tap_release: RefCell<Option<Retained<NSTimer>>>,
++    pointer_leave: RefCell<Option<Retained<NSTimer>>>,
  }
  
++/// What the one finger on the screen is doing.
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum FingerMode {
++    /// Down, not moved far yet: a tap, a scroll or a long press.
++    Pending,
++    /// Dragging: the content scrolls with it.
++    Scrolling,
++    /// Held still, then dragging: a mouse drag with the button down.
++    Pressing,
++}
++
++struct Finger {
++    id: u64,
++    start: CGPoint,
++    last: CGPoint,
++    mode: FingerMode,
++    /// Recent (time, position) pairs, for the glide's speed when the finger lifts.
++    samples: Vec<(f64, CGPoint)>,
++}
++
++/// How far a finger moves before a touch is a scroll rather than a tap, in points.
++const TAP_SLOP: f64 = 10.0;
++/// How long a finger stays still before a touch becomes a press-and-drag (selection), in seconds.
++const LONG_PRESS: f64 = 0.4;
++/// The gap between a tap's press and release, so they arrive in separate frames.
++const TAP_RELEASE: f64 = 0.04;
++/// How long after a tap the pointer stays over what was tapped (hover feedback), in seconds.
++const TAP_POINTER_LEAVE: f64 = 0.5;
++/// How long after a tap the app has to move its caret there for the on-screen keyboard to show.
++const KEYBOARD_CHECK: f64 = 0.25;
++/// How near the tap the caret must be (points): vertically (its line) and across.
++const CARET_NEAR_Y: f64 = 60.0;
++const CARET_NEAR_X: f64 = 800.0;
++
 +/// The delay before a held key repeats and the time between repeats, in seconds.
 +const KEY_REPEAT_DELAY: f64 = 0.45;
 +const KEY_REPEAT_INTERVAL: f64 = 1.0 / 30.0;
@@ -424,7 +580,19 @@ index 418968c..e6ec22d 100644
  declare_class!(
      pub(crate) struct WinitView;
  
-@@ -149,23 +196,23 @@ declare_class!(
+@@ -52,6 +148,11 @@ declare_class!(
+         fn draw_rect(&self, rect: CGRect) {
+             let mtm = MainThreadMarker::new().unwrap();
+             let window = self.window().unwrap();
++            // Documents another app asked to open, as files dropped on the window.
++            let opened = super::take_opened_files();
++            if !opened.is_empty() {
++                self.send(opened.into_iter().map(WindowEvent::DroppedFile));
++            }
+             app_state::handle_nonuser_event(
+                 mtm,
+                 EventWrapper::StaticEvent(Event::WindowEvent {
+@@ -149,29 +250,34 @@ declare_class!(
          }
  
          #[method(touchesBegan:withEvent:)]
@@ -456,7 +624,43 @@ index 418968c..e6ec22d 100644
          }
  
          #[method(pinchGesture:)]
-@@ -321,6 +368,114 @@ declare_class!(
+         fn pinch_gesture(&self, recognizer: &UIPinchGestureRecognizer) {
+             let window = self.window().unwrap();
++            // The zoom keeps the point between the fingers in place: the pointer goes there.
++            let centre = unsafe { recognizer.locationInView(None) };
++            self.send([WindowEvent::CursorMoved { device_id: DEVICE_ID, position: self.physical(centre) }]);
+ 
++            // The change as a log ratio: egui's zoom factor is its exponent.
++            let ratio = |last: CGFloat, now: CGFloat| if last > 0.0 && now > 0.0 { (now / last).ln() } else { 0.0 };
+             let (phase, delta) = match recognizer.state() {
+                 UIGestureRecognizerState::Began => {
+                     self.ivars().pinch_last_delta.set(recognizer.scale());
+@@ -179,18 +285,16 @@ declare_class!(
+                 }
+                 UIGestureRecognizerState::Changed => {
+                     let last_scale: f64 = self.ivars().pinch_last_delta.replace(recognizer.scale());
+-                    (TouchPhase::Moved, recognizer.scale() - last_scale)
++                    (TouchPhase::Moved, ratio(last_scale, recognizer.scale()))
+                 }
+                 UIGestureRecognizerState::Ended => {
+-                    let last_scale: f64 = self.ivars().pinch_last_delta.replace(0.0);
+-                    (TouchPhase::Moved, recognizer.scale() - last_scale)
++                    let last_scale: f64 = self.ivars().pinch_last_delta.replace(1.0);
++                    (TouchPhase::Ended, ratio(last_scale, recognizer.scale()))
+                 }
+-                UIGestureRecognizerState::Cancelled | UIGestureRecognizerState::Failed => {
+-                    self.ivars().rotation_last_delta.set(0.0);
+-                    // Pass -delta so that action is reversed
+-                    (TouchPhase::Cancelled, -recognizer.scale())
++                _ => {
++                    self.ivars().pinch_last_delta.set(1.0);
++                    (TouchPhase::Cancelled, 0.0)
+                 }
+-                state => panic!("unexpected recognizer state: {state:?}"),
+             };
+ 
+             let gesture_event = EventWrapper::StaticEvent(Event::WindowEvent {
+@@ -321,6 +425,133 @@ declare_class!(
          fn can_become_first_responder(&self) -> bool {
              true
          }
@@ -471,9 +675,28 @@ index 418968c..e6ec22d 100644
 +            }
 +        }
 +
++        #[method(resignFirstResponder)]
++        fn resign_first_responder(&self) -> bool {
++            let resigned: bool = unsafe { msg_send![super(self), resignFirstResponder] };
++            // The keyboard's dismiss key: the keyboard goes, but the view takes first responder
++            // back (with no keyboard) so a hardware keyboard keeps reaching the app.
++            if resigned {
++                self.ivars().soft_keyboard.set(false);
++                unsafe {
++                    let _: () = msg_send![self, performSelector: sel!(reclaimFirstResponder), withObject: std::ptr::null::<NSObject>(), afterDelay: 0.0f64];
++                }
++            }
++            resigned
++        }
++
++        #[method(reclaimFirstResponder)]
++        fn reclaim_first_responder(&self) {
++            self.ensure_first_responder();
++        }
++
 +        #[method_id(inputView)]
 +        fn input_view(&self) -> Option<Retained<UIView>> {
-+            if self.ivars().ime_allowed.get() {
++            if self.ivars().ime_allowed.get() && self.ivars().soft_keyboard.get() {
 +                None
 +            } else {
 +                self.ivars().empty_input_view.borrow().clone()
@@ -571,7 +794,7 @@ index 418968c..e6ec22d 100644
      }
  
      unsafe impl NSObjectProtocol for WinitView {}
-@@ -368,6 +523,21 @@ impl WinitView {
+@@ -368,6 +599,32 @@ impl WinitView {
              rotation_last_delta: Cell::new(0.0),
              pinch_last_delta: Cell::new(0.0),
              pan_last_delta: Cell::new(CGPoint { x: 0.0, y: 0.0 }),
@@ -590,14 +813,27 @@ index 418968c..e6ec22d 100644
 +
 +            ime_allowed: Cell::new(false),
 +            empty_input_view: RefCell::new(None),
++
++            soft_keyboard: Cell::new(false),
++            ime_caret: Cell::new(None),
++            last_tap: Cell::new(None),
++            keyboard_check: RefCell::new(None),
++
++            finger: RefCell::new(None),
++            fingers_down: RefCell::new(Vec::new()),
++            long_press: RefCell::new(None),
++            tap_release: RefCell::new(None),
++            pointer_leave: RefCell::new(None),
          });
          let this: Retained<Self> = unsafe { msg_send_id![super(this), initWithFrame: frame] };
  
-@@ -377,9 +547,288 @@ impl WinitView {
+@@ -377,9 +634,486 @@ impl WinitView {
              this.setContentScaleFactor(scale_factor as _);
          }
  
 +        this.install_pointer_recognizers(mtm);
++        // Two-finger pinch (and a trackpad pinch) zooms.
++        this.recognize_pinch_gesture(true);
 +        let empty = UIView::initWithFrame(
 +            mtm.alloc(),
 +            CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: 0.0, height: 0.0 } },
@@ -643,10 +879,206 @@ index 418968c..e6ec22d 100644
 +    /// Text input on or off: the on-screen keyboard shows only while it's on. The view stays first
 +    /// responder either way, so a hardware keyboard keeps working.
 +    pub(crate) fn set_ime_allowed(&self, allowed: bool) {
-+        if self.ivars().ime_allowed.replace(allowed) != allowed {
++        let shown = self.keyboard_shown();
++        self.ivars().ime_allowed.set(allowed);
++        if !allowed {
++            self.ivars().soft_keyboard.set(false);
++        }
++        if self.keyboard_shown() != shown {
 +            unsafe { self.reloadInputViews() };
 +        }
-+        unsafe { self.becomeFirstResponder() };
++        self.ensure_first_responder();
++    }
++
++    /// Where the app's caret is, for the on-screen keyboard's decision (physical pixels).
++    pub(crate) fn set_ime_caret(&self, x: f64, y: f64, width: f64, height: f64) {
++        let scale = self.contentScaleFactor() as f64;
++        let scale = if scale > 0.0 { scale } else { 1.0 };
++        self.ivars().ime_caret.set(Some(CGRect {
++            origin: CGPoint { x: (x / scale) as _, y: (y / scale) as _ },
++            size: CGSize { width: (width / scale) as _, height: (height / scale) as _ },
++        }));
++    }
++
++    fn keyboard_shown(&self) -> bool {
++        self.ivars().ime_allowed.get() && self.ivars().soft_keyboard.get()
++    }
++
++    /// After a tap: the on-screen keyboard shows when text input is on and the app put its caret
++    /// where the finger landed, a tap into text. A tap on a button leaves the caret elsewhere.
++    fn check_keyboard(&self) {
++        self.ivars().keyboard_check.take();
++        let (Some(tap), Some(caret)) = (self.ivars().last_tap.get(), self.ivars().ime_caret.get()) else { return };
++        if !self.ivars().ime_allowed.get() || self.ivars().soft_keyboard.get() {
++            return;
++        }
++        let near_x = (caret.origin.x - CARET_NEAR_X..=caret.origin.x + caret.size.width + CARET_NEAR_X).contains(&tap.x);
++        let near_y = (caret.origin.y - CARET_NEAR_Y..=caret.origin.y + caret.size.height + CARET_NEAR_Y).contains(&tap.y);
++        if near_x && near_y {
++            self.ivars().soft_keyboard.set(true);
++            unsafe { self.reloadInputViews() };
++            self.ensure_first_responder();
++        }
++    }
++
++    /// First responder again, unless something is presented over the app (a picker, whose own
++    /// fields need the keyboard).
++    fn ensure_first_responder(&self) {
++        if unsafe { self.isFirstResponder() } {
++            return;
++        }
++        let presented = self
++            .window()
++            .and_then(|w| w.rootViewController())
++            .and_then(|vc| unsafe { vc.presentedViewController() })
++            .is_some();
++        if !presented {
++            unsafe { self.becomeFirstResponder() };
++        }
++    }
++
++    /// A timer that calls `f` on this view after `delay` seconds, once.
++    fn after(&self, delay: f64, f: fn(&WinitView)) -> Retained<NSTimer> {
++        let weak = Weak::from_retained(&self.retain());
++        let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
++            if let Some(view) = weak.load() {
++                f(&view);
++            }
++        });
++        unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(delay, false, &block) }
++    }
++
++    fn cancel(timer: &RefCell<Option<Retained<NSTimer>>>) {
++        if let Some(timer) = timer.take() {
++            unsafe { timer.invalidate() };
++        }
++    }
++
++    fn mouse(&self, state: ElementState) -> WindowEvent {
++        WindowEvent::MouseInput { device_id: DEVICE_ID, state, button: MouseButton::Left }
++    }
++
++    /// A tap's release, if it hasn't been sent yet.
++    fn flush_tap_release(&self) {
++        if let Some(timer) = self.ivars().tap_release.take() {
++            unsafe { timer.invalidate() };
++            self.send([self.mouse(ElementState::Released)]);
++        }
++    }
++
++    /// One finger on the screen: a tap clicks, a drag scrolls (and glides on), and a long press
++    /// then drag is a mouse drag (it selects text). A second finger ends it: two fingers pinch.
++    fn handle_finger(&self, touch: &UITouch) {
++        let id = touch as *const UITouch as u64;
++        let at = touch.locationInView(None);
++        let time = touch.timestamp();
++        match touch.phase() {
++            UITouchPhase::Began => {
++                self.flush_tap_release();
++                Self::cancel(&self.ivars().pointer_leave);
++                self.ensure_first_responder();
++                self.ivars().fingers_down.borrow_mut().push(id);
++                if self.ivars().fingers_down.borrow().len() == 1 {
++                    self.ivars().finger.replace(Some(Finger { id, start: at, last: at, mode: FingerMode::Pending, samples: vec![(time, at)] }));
++                    let timer = self.after(LONG_PRESS, |view| view.long_press());
++                    self.ivars().long_press.replace(Some(timer));
++                } else {
++                    self.end_finger(at, false);
++                }
++            }
++            UITouchPhase::Moved => {
++                let mut finger = self.ivars().finger.borrow_mut();
++                let Some(f) = finger.as_mut().filter(|f| f.id == id) else { return };
++                let (dx, dy) = (at.x - f.last.x, at.y - f.last.y);
++                f.last = at;
++                f.samples.push((time, at));
++                f.samples.retain(|(t, _)| time - *t <= 0.1);
++                let mode = f.mode;
++                let moved_far = (at.x - f.start.x).hypot(at.y - f.start.y) > TAP_SLOP;
++                if mode == FingerMode::Pending && moved_far {
++                    f.mode = FingerMode::Scrolling;
++                    let (sx, sy) = (at.x - f.start.x, at.y - f.start.y);
++                    drop(finger);
++                    Self::cancel(&self.ivars().long_press);
++                    self.send([self.wheel(0.0, 0.0, TouchPhase::Started), self.wheel(sx as f64, sy as f64, TouchPhase::Moved)]);
++                    return;
++                }
++                drop(finger);
++                match mode {
++                    FingerMode::Scrolling => self.send([self.wheel(dx as f64, dy as f64, TouchPhase::Moved)]),
++                    FingerMode::Pressing => self.send([WindowEvent::CursorMoved { device_id: DEVICE_ID, position: self.physical(at) }]),
++                    FingerMode::Pending => {}
++                }
++            }
++            UITouchPhase::Ended | UITouchPhase::Cancelled => {
++                let cancelled = touch.phase() == UITouchPhase::Cancelled;
++                self.ivars().fingers_down.borrow_mut().retain(|d| *d != id);
++                if self.ivars().finger.borrow().as_ref().is_some_and(|f| f.id == id) {
++                    self.end_finger(at, !cancelled);
++                }
++            }
++            _ => {}
++        }
++    }
++
++    /// The finger lifted (`lifted`), or another one landed: finish what it was doing.
++    fn end_finger(&self, at: CGPoint, lifted: bool) {
++        Self::cancel(&self.ivars().long_press);
++        let Some(finger) = self.ivars().finger.take() else { return };
++        let position = self.physical(at);
++        match finger.mode {
++            FingerMode::Pending if lifted => {
++                // A tap: a click where it landed, its release a moment later so the app sees a
++                // press and a release; the pointer leaves again after a while.
++                self.send([WindowEvent::CursorEntered { device_id: DEVICE_ID }, WindowEvent::CursorMoved { device_id: DEVICE_ID, position }, self.mouse(ElementState::Pressed)]);
++                let release = self.after(TAP_RELEASE, |view| {
++                    view.ivars().tap_release.take();
++                    view.send([view.mouse(ElementState::Released)]);
++                });
++                self.ivars().tap_release.replace(Some(release));
++                let leave = self.after(TAP_POINTER_LEAVE, |view| {
++                    view.ivars().pointer_leave.take();
++                    if view.ivars().fingers_down.borrow().is_empty() {
++                        view.send([WindowEvent::CursorLeft { device_id: DEVICE_ID }]);
++                    }
++                });
++                self.ivars().pointer_leave.replace(Some(leave));
++                self.ivars().last_tap.set(Some(at));
++                Self::cancel(&self.ivars().keyboard_check);
++                let check = self.after(KEYBOARD_CHECK, |view| view.check_keyboard());
++                self.ivars().keyboard_check.replace(Some(check));
++            }
++            FingerMode::Pending => {}
++            FingerMode::Scrolling => {
++                self.send([self.wheel(0.0, 0.0, TouchPhase::Ended)]);
++                if lifted {
++                    let velocity = match (finger.samples.first(), finger.samples.last()) {
++                        (Some((t0, p0)), Some((t1, p1))) if t1 - t0 > 0.005 => {
++                            let dt = (t1 - t0) as CGFloat;
++                            CGPoint { x: (p1.x - p0.x) / dt, y: (p1.y - p0.y) / dt }
++                        }
++                        _ => CGPoint { x: 0.0, y: 0.0 },
++                    };
++                    self.start_glide(velocity);
++                }
++            }
++            FingerMode::Pressing => {
++                self.send([WindowEvent::CursorMoved { device_id: DEVICE_ID, position }, self.mouse(ElementState::Released)]);
++            }
++        }
++    }
++
++    /// The finger stayed still: the button goes down where it is, and moving drags.
++    fn long_press(&self) {
++        self.ivars().long_press.take();
++        let start = {
++            let mut finger = self.ivars().finger.borrow_mut();
++            let Some(f) = finger.as_mut().filter(|f| f.mode == FingerMode::Pending) else { return };
++            f.mode = FingerMode::Pressing;
++            f.last
++        };
++        let position = self.physical(start);
++        self.send([WindowEvent::CursorEntered { device_id: DEVICE_ID }, WindowEvent::CursorMoved { device_id: DEVICE_ID, position }, self.mouse(ElementState::Pressed)]);
 +    }
 +
 +    fn physical(&self, logical: CGPoint) -> PhysicalPosition<f64> {
@@ -882,7 +1314,7 @@ index 418968c..e6ec22d 100644
      fn window(&self) -> Option<Retained<WinitUIWindow>> {
          // SAFETY: `WinitView`s are always installed in a `WinitUIWindow`
          (**self).window().map(|window| unsafe { Retained::cast(window) })
-@@ -474,13 +923,45 @@ impl WinitView {
+@@ -474,13 +1208,49 @@ impl WinitView {
          }
      }
  
@@ -898,9 +1330,13 @@ index 418968c..e6ec22d 100644
          for touch in touches {
              let logical_location = touch.locationInView(None);
              let touch_type = touch.r#type();
-+            // A trackpad or mouse click (`UIApplicationSupportsIndirectInputEvents`): mouse
-+            // buttons at the pointer, not a finger on the screen.
-+            if touch_type == UITouchType::IndirectPointer {
++            if touch_type == UITouchType::Direct {
++                self.handle_finger(touch);
++                continue;
++            }
++            // A trackpad or mouse click (`UIApplicationSupportsIndirectInputEvents`), or Apple
++            // Pencil: mouse buttons at the pointer, so the pencil selects as it moves.
++            if touch_type == UITouchType::IndirectPointer || touch_type == UITouchType::Pencil {
 +                let window_id = RootWindowId(window.id());
 +                let position = self.physical(logical_location);
 +                let touch_id = touch as *const UITouch as u64;
@@ -929,7 +1365,7 @@ index 418968c..e6ec22d 100644
              let force = if os_supports_force {
                  let trait_collection = self.traitCollection();
                  let touch_capability = trait_collection.forceTouchCapability();
-@@ -544,6 +1025,17 @@ impl WinitView {
+@@ -544,6 +1314,17 @@ impl WinitView {
          let window = self.window().unwrap();
          let window_id = RootWindowId(window.id());
          let mtm = MainThreadMarker::new().unwrap();
@@ -947,7 +1383,7 @@ index 418968c..e6ec22d 100644
          // send individual events for each character
          app_state::handle_nonuser_events(
              mtm,
-@@ -579,6 +1071,64 @@ impl WinitView {
+@@ -579,6 +1360,64 @@ impl WinitView {
      }
  
      fn handle_delete_backward(&self) {
@@ -1012,7 +1448,7 @@ index 418968c..e6ec22d 100644
          let window = self.window().unwrap();
          let window_id = RootWindowId(window.id());
          let mtm = MainThreadMarker::new().unwrap();
-@@ -605,3 +1155,13 @@ impl WinitView {
+@@ -605,3 +1444,13 @@ impl WinitView {
          );
      }
  }
@@ -1027,10 +1463,25 @@ index 418968c..e6ec22d 100644
 +    unsafe { msg_send_id![NSSet::<UIPress>::class(), setWithArray: &*array] }
 +}
 diff --git a/src/platform_impl/ios/window.rs b/src/platform_impl/ios/window.rs
-index a386eca..f02ce72 100644
+index a386eca..314e118 100644
 --- a/src/platform_impl/ios/window.rs
 +++ b/src/platform_impl/ios/window.rs
-@@ -372,15 +372,7 @@ impl Inner {
+@@ -363,8 +363,12 @@ impl Inner {
+         warn!("`Window::set_window_icon` is ignored on iOS")
+     }
+ 
+-    pub fn set_ime_cursor_area(&self, _position: Position, _size: Size) {
+-        warn!("`Window::set_ime_cursor_area` is ignored on iOS")
++    /// The caret of the text being edited: the on-screen keyboard shows for a tap near it.
++    pub fn set_ime_cursor_area(&self, position: Position, size: Size) {
++        let scale = self.view.contentScaleFactor() as f64;
++        let position = position.to_physical::<f64>(scale);
++        let size = size.to_physical::<f64>(scale);
++        self.view.set_ime_caret(position.x, position.y, size.width, size.height);
+     }
+ 
+     /// Show / hide the keyboard. To show the keyboard, we call `becomeFirstResponder`,
+@@ -372,15 +376,7 @@ impl Inner {
      /// [objc2_ui_kit::UIKeyInput], the keyboard will be shown.
      /// <https://developer.apple.com/documentation/uikit/uiresponder/1621113-becomefirstresponder>
      pub fn set_ime_allowed(&self, allowed: bool) {

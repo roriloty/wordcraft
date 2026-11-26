@@ -1,3 +1,50 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 54074f9..f9e179e 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -211,3 +211,42 @@ features = [
+     "Win32_UI_Shell",
+     "Win32_UI_WindowsAndMessaging",
+ ]
++
++[target.'cfg(target_os = "ios")'.dependencies.objc2]
++version = "0.6.0"
++
++[target.'cfg(target_os = "ios")'.dependencies.objc2-foundation]
++version = "0.3.0"
++features = [
++    "std",
++    "NSArray",
++    "NSEnumerator",
++    "NSObject",
++    "NSString",
++    "NSURL",
++]
++default-features = false
++
++[target.'cfg(target_os = "ios")'.dependencies.objc2-ui-kit]
++version = "0.3.0"
++features = [
++    "std",
++    "block2",
++    "objc2-uniform-type-identifiers",
++    "UIApplication",
++    "UIDocumentPickerViewController",
++    "UIResponder",
++    "UIView",
++    "UIViewController",
++    "UIWindow",
++]
++default-features = false
++
++[target.'cfg(target_os = "ios")'.dependencies.objc2-uniform-type-identifiers]
++version = "0.3.0"
++features = [
++    "std",
++    "UTType",
++    "UTCoreTypes",
++]
++default-features = false
 diff --git a/src/backend.rs b/src/backend.rs
 index a4edf24..f237035 100755
 --- a/src/backend.rs
@@ -13,15 +60,34 @@ index a4edf24..f237035 100755
  #[cfg(target_os = "windows")]
 diff --git a/src/backend/ios.rs b/src/backend/ios.rs
 new file mode 100644
-index 0000000..f5a7b23
+index 0000000..090aaf9
 --- /dev/null
 +++ b/src/backend/ios.rs
-@@ -0,0 +1,75 @@
-+//! iOS: no native dialogs. UIKit's document picker cannot run as a blocking modal loop, so
-+//! every file and folder dialog answers "cancelled" and the app uses its own file chooser.
-+//! A message dialog is logged and answers `Cancel`, the answer that changes nothing.
+@@ -0,0 +1,305 @@
++//! iOS and iPadOS: UIKit's document picker, the one the Files app shows.
++//!
++//! - Open: the picked documents in place (not copies), with their security scope held for the
++//!   rest of the process, so the app can save back to them.
++//! - Save: an empty file of the suggested name is exported (moved) to the place the person picks,
++//!   where the system handles names already taken; the app then writes the document over it.
++//! - Folder: the picked folder, in place.
++//!
++//! UIKit can only present the picker asynchronously, so only the async dialogs show it; they must
++//! be created on the main thread (creating the future presents the picker, as on macOS). The
++//! blocking dialogs and any dialog asked for off the main thread answer "nothing picked". A
++//! message dialog is logged and answers `Cancel`, the answer that changes nothing.
 +
++use std::cell::RefCell;
 +use std::path::PathBuf;
++
++use objc2::rc::Retained;
++use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
++use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
++use objc2_foundation::{NSArray, NSString, NSURL};
++use objc2_ui_kit::{
++    UIApplication, UIDocumentPickerDelegate, UIDocumentPickerViewController, UIViewController,
++};
++use objc2_uniform_type_identifiers::{UTType, UTTypeFolder, UTTypeItem};
 +
 +use crate::backend::{
 +    AsyncFilePickerDialogImpl, AsyncFileSaveDialogImpl, AsyncFolderPickerDialogImpl,
@@ -30,7 +96,213 @@ index 0000000..f5a7b23
 +};
 +use crate::file_dialog::FileDialog;
 +use crate::message_dialog::{MessageDialog, MessageDialogResult};
++use crate::oneshot;
 +use crate::FileHandle;
++
++/// What a picker is for.
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum Mode {
++    Open { multiple: bool },
++    Folder,
++    Save,
++}
++
++struct PickerState {
++    picker: RefCell<Option<Retained<UIDocumentPickerViewController>>>,
++    /// The empty file a Save exports, removed again when the person cancels.
++    placeholder: RefCell<Option<PathBuf>>,
++    answer: RefCell<Option<oneshot::Sender<Option<Vec<PathBuf>>>>>,
++}
++
++define_class!(
++    #[unsafe(super(NSObject))]
++    #[thread_kind = MainThreadOnly]
++    #[name = "RfdDocumentPickerDelegate"]
++    #[ivars = PickerState]
++    struct PickerDelegate;
++
++    unsafe impl NSObjectProtocol for PickerDelegate {}
++
++    unsafe impl UIDocumentPickerDelegate for PickerDelegate {
++        #[unsafe(method(documentPicker:didPickDocumentsAtURLs:))]
++        fn did_pick(&self, _picker: &UIDocumentPickerViewController, urls: &NSArray<NSURL>) {
++            let mut paths = Vec::new();
++            for url in urls.iter() {
++                // Held until the process ends: the app reads the document now and saves to it later.
++                let _ = unsafe { url.startAccessingSecurityScopedResource() };
++                if let Some(path) = url.path() {
++                    paths.push(PathBuf::from(path.to_string()));
++                }
++            }
++            self.ivars().placeholder.take();
++            self.finish(if paths.is_empty() { None } else { Some(paths) });
++        }
++
++        #[unsafe(method(documentPickerWasCancelled:))]
++        fn was_cancelled(&self, _picker: &UIDocumentPickerViewController) {
++            if let Some(placeholder) = self.ivars().placeholder.take() {
++                let _ = std::fs::remove_file(&placeholder);
++                if let Some(dir) = placeholder.parent() {
++                    let _ = std::fs::remove_dir(dir);
++                }
++            }
++            self.finish(None);
++        }
++    }
++
++    impl PickerDelegate {
++        /// Presents the picker over the app's frontmost view controller, a run-loop turn after the
++        /// dialog was asked for (not in the middle of the frame that asked).
++        #[unsafe(method(present))]
++        fn present(&self) {
++            let mtm = self.mtm();
++            let picker = self.ivars().picker.borrow().clone();
++            match (picker, top_view_controller(mtm)) {
++                (Some(picker), Some(top)) => {
++                    top.presentViewController_animated_completion(&picker, true, None);
++                }
++                _ => {
++                    log::warn!("no view controller to present the document picker on");
++                    self.finish(None);
++                }
++            }
++        }
++    }
++);
++
++thread_local! {
++    /// The pickers on screen: UIKit holds its delegate weakly.
++    static ACTIVE: RefCell<Vec<Retained<PickerDelegate>>> = const { RefCell::new(Vec::new()) };
++}
++
++impl PickerDelegate {
++    fn finish(&self, answer: Option<Vec<PathBuf>>) {
++        if let Some(sender) = self.ivars().answer.take() {
++            let _ = sender.send(answer);
++        }
++        self.ivars().picker.take();
++        ACTIVE.with(|active| active.borrow_mut().retain(|d| !std::ptr::eq(&**d, self)));
++    }
++}
++
++/// The view controller everything else is presented over.
++fn top_view_controller(mtm: MainThreadMarker) -> Option<Retained<UIViewController>> {
++    let app = UIApplication::sharedApplication(mtm);
++    #[allow(deprecated)]
++    let windows = app.windows();
++    let window = windows.iter().find(|w| w.isKeyWindow()).or_else(|| windows.iter().next())?;
++    let mut top = window.rootViewController()?;
++    while let Some(next) = top.presentedViewController() {
++        top = next;
++    }
++    Some(top)
++}
++
++/// The content types of the dialog's filters; anything when it has none.
++fn content_types(dialog: &FileDialog) -> Retained<NSArray<UTType>> {
++    let mut types: Vec<Retained<UTType>> = Vec::new();
++    for filter in &dialog.filters {
++        for extension in &filter.extensions {
++            let extension = extension.trim_start_matches('.');
++            if extension == "*" || extension.is_empty() {
++                continue;
++            }
++            if let Some(t) = UTType::typeWithFilenameExtension(&NSString::from_str(extension)) {
++                if !types.iter().any(|known| known.isEqual(Some(&t))) {
++                    types.push(t);
++                }
++            }
++        }
++    }
++    if types.is_empty() || dialog.filters.iter().any(|f| f.extensions.iter().any(|e| e == "*")) {
++        types = vec![unsafe { UTTypeItem }.retain()];
++    }
++    NSArray::from_retained_slice(&types)
++}
++
++/// An empty file named as the save suggests, in a folder of its own under the app's temporary
++/// folder, for the picker to move where the person picks.
++fn placeholder(dialog: &FileDialog) -> Option<PathBuf> {
++    let name = dialog.file_name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| "Untitled".into());
++    let dir = std::env::temp_dir().join(format!("rfd-save-{}-{}", std::process::id(), unique()));
++    std::fs::create_dir_all(&dir).ok()?;
++    let path = dir.join(name);
++    std::fs::write(&path, b"").ok()?;
++    Some(path)
++}
++
++fn unique() -> u64 {
++    use std::sync::atomic::{AtomicU64, Ordering};
++    static NEXT: AtomicU64 = AtomicU64::new(0);
++    NEXT.fetch_add(1, Ordering::Relaxed)
++}
++
++/// Shows the picker for `mode`; the answer arrives when the person picks or cancels.
++fn show(dialog: FileDialog, mode: Mode) -> oneshot::Receiver<Option<Vec<PathBuf>>> {
++    let (sender, receiver) = oneshot::channel();
++    let Some(mtm) = MainThreadMarker::new() else {
++        log::warn!("the document picker can only be asked for on the main thread");
++        let _ = sender.send(None);
++        return receiver;
++    };
++    let mut placeholder_path = None;
++    let picker = match mode {
++        Mode::Open { multiple } => {
++            let picker = UIDocumentPickerViewController::initForOpeningContentTypes_asCopy(
++                UIDocumentPickerViewController::alloc(mtm),
++                &content_types(&dialog),
++                false,
++            );
++            picker.setAllowsMultipleSelection(multiple);
++            picker
++        }
++        Mode::Folder => {
++            let folder = unsafe { UTTypeFolder }.retain();
++            UIDocumentPickerViewController::initForOpeningContentTypes_asCopy(
++                UIDocumentPickerViewController::alloc(mtm),
++                &NSArray::from_retained_slice(&[folder]),
++                false,
++            )
++        }
++        Mode::Save => {
++            let Some(path) = placeholder(&dialog) else {
++                log::warn!("couldn't make the file the save picker exports");
++                let _ = sender.send(None);
++                return receiver;
++            };
++            let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
++            placeholder_path = Some(path);
++            UIDocumentPickerViewController::initForExportingURLs_asCopy(
++                UIDocumentPickerViewController::alloc(mtm),
++                &NSArray::from_retained_slice(&[url]),
++                false,
++            )
++        }
++    };
++    picker.setShouldShowFileExtensions(true);
++    let delegate: Retained<PickerDelegate> = {
++        let this = PickerDelegate::alloc(mtm).set_ivars(PickerState {
++            picker: RefCell::new(Some(picker.clone())),
++            placeholder: RefCell::new(placeholder_path),
++            answer: RefCell::new(Some(sender)),
++        });
++        unsafe { msg_send![super(this), init] }
++    };
++    picker.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
++    unsafe {
++        let _: () = msg_send![&*delegate, performSelector: sel!(present), withObject: Option::<&NSObject>::None, afterDelay: 0.0f64];
++    }
++    ACTIVE.with(|active| active.borrow_mut().push(delegate));
++    receiver
++}
++
++fn one(paths: Option<Vec<PathBuf>>) -> Option<FileHandle> {
++    paths.and_then(|p| p.into_iter().next()).map(FileHandle::wrap)
++}
++
++fn all(paths: Option<Vec<PathBuf>>) -> Option<Vec<FileHandle>> {
++    paths.map(|p| p.into_iter().map(FileHandle::wrap).collect())
++}
 +
 +impl FilePickerDialogImpl for FileDialog {
 +    fn pick_file(self) -> Option<PathBuf> {
@@ -58,25 +330,30 @@ index 0000000..f5a7b23
 +
 +impl AsyncFilePickerDialogImpl for FileDialog {
 +    fn pick_file_async(self) -> DialogFutureType<Option<FileHandle>> {
-+        Box::pin(std::future::ready(None))
++        let answer = show(self, Mode::Open { multiple: false });
++        Box::pin(async move { one(answer.await.ok().flatten()) })
 +    }
 +    fn pick_files_async(self) -> DialogFutureType<Option<Vec<FileHandle>>> {
-+        Box::pin(std::future::ready(None))
++        let answer = show(self, Mode::Open { multiple: true });
++        Box::pin(async move { all(answer.await.ok().flatten()) })
 +    }
 +}
 +
 +impl AsyncFolderPickerDialogImpl for FileDialog {
 +    fn pick_folder_async(self) -> DialogFutureType<Option<FileHandle>> {
-+        Box::pin(std::future::ready(None))
++        let answer = show(self, Mode::Folder);
++        Box::pin(async move { one(answer.await.ok().flatten()) })
 +    }
 +    fn pick_folders_async(self) -> DialogFutureType<Option<Vec<FileHandle>>> {
-+        Box::pin(std::future::ready(None))
++        let answer = show(self, Mode::Folder);
++        Box::pin(async move { all(answer.await.ok().flatten()) })
 +    }
 +}
 +
 +impl AsyncFileSaveDialogImpl for FileDialog {
 +    fn save_file_async(self) -> DialogFutureType<Option<FileHandle>> {
-+        Box::pin(std::future::ready(None))
++        let answer = show(self, Mode::Save);
++        Box::pin(async move { one(answer.await.ok().flatten()) })
 +    }
 +}
 +
@@ -89,6 +366,6 @@ index 0000000..f5a7b23
 +
 +impl AsyncMessageDialogImpl for MessageDialog {
 +    fn show_async(self) -> DialogFutureType<MessageDialogResult> {
-+        Box::pin(std::future::ready(self.show()))
++        Box::pin(std::future::ready(MessageDialogImpl::show(self)))
 +    }
 +}
