@@ -159,3 +159,21 @@ pub fn prepare_folders() {
         log::warn!("Documents folder {}: {e}", dir.display());
     }
 }
+
+/// The touch selection's handle areas and edit menu, handed to the window layer in physical
+/// pixels: a finger on a handle drags it at once, and the system edit menu opens over the
+/// selection a touch just made.
+pub fn touch_overlay(ctx: &egui::Context, overlay: wordcraft_ui_egui::touch_selection::TouchOverlay) {
+    let ppp = f64::from(ctx.pixels_per_point());
+    let px = |r: egui::Rect| (f64::from(r.min.x) * ppp, f64::from(r.min.y) * ppp, f64::from(r.width()) * ppp, f64::from(r.height()) * ppp);
+    let grab: Vec<_> = overlay.grab.into_iter().map(px).collect();
+    winit::platform::ios::set_touch_grab_regions(&grab);
+    if let Some(rect) = overlay.edit_menu {
+        winit::platform::ios::show_edit_menu(px(rect));
+    }
+}
+
+/// Whether the latest pointer input came from a finger on the screen.
+pub fn last_input_was_touch() -> bool {
+    winit::platform::ios::last_input_was_touch()
+}

@@ -1,5 +1,5 @@
 diff --git a/Cargo.toml b/Cargo.toml
-index 72be2b0..a0dc937 100644
+index 72be2b0..5b63e58 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -193,6 +193,10 @@ features = [
@@ -13,11 +13,18 @@ index 72be2b0..a0dc937 100644
  ]
  
  [target.'cfg(target_os = "ios")'.dependencies.objc2-ui-kit]
-@@ -203,6 +207,12 @@ features = [
+@@ -203,6 +207,19 @@ features = [
      "UIEvent",
      "UIGeometry",
      "UIGestureRecognizer",
 +    "UICommand",
++    "UIAction",
++    "UIEditMenuInteraction",
++    "UIImage",
++    "UIInteraction",
++    "UIMenu",
++    "UIMenuElement",
++    "block2",
 +    "UIHoverGestureRecognizer",
 +    "UIKey",
 +    "UIKeyConstants",
@@ -26,6 +33,35 @@ index 72be2b0..a0dc937 100644
      "UITextInput",
      "UITextInputTraits",
      "UIOrientation",
+diff --git a/src/platform/ios.rs b/src/platform/ios.rs
+index 6e62876..14bf540 100644
+--- a/src/platform/ios.rs
++++ b/src/platform/ios.rs
+@@ -433,3 +433,24 @@ pub enum StatusBarStyle {
+     LightContent,
+     DarkContent,
+ }
++
++/// Screen areas (physical pixels: x, y, width, height) where a finger press goes to the app at
++/// once as a mouse press, instead of waiting to tell a tap from a scroll: handles the app draws
++/// for a finger to drag, such as a text selection's. Replaces the areas set before.
++pub fn set_touch_grab_regions(regions: &[(f64, f64, f64, f64)]) {
++    crate::platform_impl::set_touch_grab_regions(regions);
++}
++
++/// Shows the system edit menu pointing at `rect` (physical pixels: x, y, width, height): Cut,
++/// Copy, Paste, Select All, Bold, Italic, Underline and Font. A choice reaches the app as its
++/// keyboard shortcut (Command+X, Command+C, Shift+Insert, Command+A, Command+B, Command+I,
++/// Command+U, Command+D). Call on the main thread.
++pub fn show_edit_menu(rect: (f64, f64, f64, f64)) {
++    crate::platform_impl::show_edit_menu(rect);
++}
++
++/// Whether the latest pointer input came from a finger on the screen, rather than a trackpad, a
++/// mouse or Apple Pencil.
++pub fn last_input_was_touch() -> bool {
++    crate::platform_impl::last_input_was_touch()
++}
 diff --git a/src/platform_impl/ios/event_loop.rs b/src/platform_impl/ios/event_loop.rs
 index a093b7b..49cfa25 100644
 --- a/src/platform_impl/ios/event_loop.rs
@@ -411,7 +447,7 @@ index 0000000..057a318
 +    })
 +}
 diff --git a/src/platform_impl/ios/mod.rs b/src/platform_impl/ios/mod.rs
-index 69e79c9..7896721 100644
+index 69e79c9..b56094e 100644
 --- a/src/platform_impl/ios/mod.rs
 +++ b/src/platform_impl/ios/mod.rs
 @@ -1,6 +1,7 @@
@@ -422,7 +458,7 @@ index 69e79c9..7896721 100644
  mod event_loop;
  mod monitor;
  mod notification_center;
-@@ -50,3 +51,17 @@ impl fmt::Display for OsError {
+@@ -50,3 +51,61 @@ impl fmt::Display for OsError {
          write!(f, "os error")
      }
  }
@@ -440,20 +476,65 @@ index 69e79c9..7896721 100644
 +pub(crate) fn take_opened_files() -> Vec<std::path::PathBuf> {
 +    OPENED_FILES.lock().map(|mut files| std::mem::take(&mut *files)).unwrap_or_default()
 +}
++
++/// The app's touch grab areas (physical pixels), see `platform::ios::set_touch_grab_regions`.
++static GRAB_REGIONS: std::sync::Mutex<Vec<(f64, f64, f64, f64)>> = std::sync::Mutex::new(Vec::new());
++static LAST_INPUT_TOUCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++
++pub(crate) fn set_touch_grab_regions(regions: &[(f64, f64, f64, f64)]) {
++    if let Ok(mut r) = GRAB_REGIONS.lock() {
++        r.clear();
++        r.extend_from_slice(regions);
++    }
++}
++
++/// Whether the physical point (x, y) is in one of the app's touch grab areas.
++pub(crate) fn in_touch_grab_region(x: f64, y: f64) -> bool {
++    GRAB_REGIONS
++        .lock()
++        .map(|r| r.iter().any(|&(rx, ry, rw, rh)| x >= rx && x <= rx + rw && y >= ry && y <= ry + rh))
++        .unwrap_or(false)
++}
++
++pub(crate) fn set_last_input_touch(touch: bool) {
++    LAST_INPUT_TOUCH.store(touch, std::sync::atomic::Ordering::Relaxed);
++}
++
++pub(crate) fn last_input_was_touch() -> bool {
++    LAST_INPUT_TOUCH.load(std::sync::atomic::Ordering::Relaxed)
++}
++
++pub(crate) fn show_edit_menu(rect: (f64, f64, f64, f64)) {
++    use objc2::runtime::NSObjectProtocol as _;
++    let Some(mtm) = objc2_foundation::MainThreadMarker::new() else { return };
++    let app = objc2_ui_kit::UIApplication::sharedApplication(mtm);
++    #[allow(deprecated)]
++    let windows = app.windows();
++    for window in windows.iter() {
++        let Some(view) = window.rootViewController().and_then(|vc| vc.view()) else { continue };
++        if view.isKindOfClass(<view::WinitView as objc2::ClassType>::class()) {
++            // SAFETY: checked to be a `WinitView` just above.
++            let view: objc2::rc::Retained<view::WinitView> = unsafe { objc2::rc::Retained::cast(view) };
++            view.show_edit_menu(rect);
++            return;
++        }
++    }
++}
 diff --git a/src/platform_impl/ios/view.rs b/src/platform_impl/ios/view.rs
-index 418968c..fd95139 100644
+index 418968c..751fdd7 100644
 --- a/src/platform_impl/ios/view.rs
 +++ b/src/platform_impl/ios/view.rs
-@@ -1,22 +1,35 @@
+@@ -1,22 +1,37 @@
  #![allow(clippy::unnecessary_cast)]
  use std::cell::{Cell, RefCell};
 +use std::collections::HashMap;
 +use std::ptr::NonNull;
  
 -use objc2::rc::Retained;
+-use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 +use block2::RcBlock;
 +use objc2::rc::{Retained, Weak};
- use objc2::runtime::{NSObjectProtocol, ProtocolObject};
++use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject, Sel};
  use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 -use objc2_foundation::{CGFloat, CGPoint, CGRect, MainThreadMarker, NSObject, NSSet, NSString};
 +use objc2_foundation::{
@@ -465,7 +546,9 @@ index 418968c..fd95139 100644
 -    UIPinchGestureRecognizer, UIResponder, UIRotationGestureRecognizer, UITapGestureRecognizer,
 -    UITextInputTraits, UITouch, UITouchPhase, UITouchType, UITraitEnvironment, UIView,
 +    UICoordinateSpace, UIEvent, UIEventButtonMask, UIForceTouchCapability, UIGestureRecognizer,
-+    UIGestureRecognizerDelegate, UIGestureRecognizerState, UIHoverGestureRecognizer, UIKeyInput,
++    UIAction, UIEditMenuConfiguration, UIEditMenuInteraction, UIEditMenuInteractionDelegate,
++    UIGestureRecognizerDelegate, UIGestureRecognizerState, UIHoverGestureRecognizer, UIKeyInput, UIMenu,
++    UIMenuElement,
 +    UIPanGestureRecognizer, UIPinchGestureRecognizer, UIPress, UIPressesEvent, UIResponder,
 +    UIRotationGestureRecognizer, UIScrollTypeMask, UITapGestureRecognizer, UITextInputTraits,
 +    UITouch, UITouchPhase, UITouchType, UITraitEnvironment, UIView,
@@ -488,7 +571,7 @@ index 418968c..fd95139 100644
  use crate::platform_impl::platform::DEVICE_ID;
  use crate::platform_impl::KeyEventExtra;
  use crate::window::{WindowAttributes, WindowId as RootWindowId};
-@@ -31,8 +44,91 @@ pub struct WinitViewState {
+@@ -31,8 +46,97 @@ pub struct WinitViewState {
      rotation_last_delta: Cell<CGFloat>,
      pinch_last_delta: Cell<CGFloat>,
      pan_last_delta: Cell<CGPoint>,
@@ -530,8 +613,14 @@ index 418968c..fd95139 100644
 +    long_press: RefCell<Option<Retained<NSTimer>>>,
 +    tap_release: RefCell<Option<Retained<NSTimer>>>,
 +    pointer_leave: RefCell<Option<Retained<NSTimer>>>,
- }
- 
++
++    // The system edit menu the app asks for over a selection: where it points (points), and
++    // whether it is up (only then does the view take the standard edit actions).
++    edit_menu: RefCell<Option<Retained<UIEditMenuInteraction>>>,
++    edit_menu_rect: Cell<CGRect>,
++    edit_menu_up: Cell<bool>,
++}
++
 +/// What the one finger on the screen is doing.
 +#[derive(Clone, Copy, PartialEq, Eq)]
 +enum FingerMode {
@@ -550,8 +639,8 @@ index 418968c..fd95139 100644
 +    mode: FingerMode,
 +    /// Recent (time, position) pairs, for the glide's speed when the finger lifts.
 +    samples: Vec<(f64, CGPoint)>,
-+}
-+
+ }
+ 
 +/// How far a finger moves before a touch is a scroll rather than a tap, in points.
 +const TAP_SLOP: f64 = 10.0;
 +/// How long a finger stays still before a touch becomes a press-and-drag (selection), in seconds.
@@ -580,7 +669,7 @@ index 418968c..fd95139 100644
  declare_class!(
      pub(crate) struct WinitView;
  
-@@ -52,6 +148,11 @@ declare_class!(
+@@ -52,6 +156,11 @@ declare_class!(
          fn draw_rect(&self, rect: CGRect) {
              let mtm = MainThreadMarker::new().unwrap();
              let window = self.window().unwrap();
@@ -592,7 +681,7 @@ index 418968c..fd95139 100644
              app_state::handle_nonuser_event(
                  mtm,
                  EventWrapper::StaticEvent(Event::WindowEvent {
-@@ -149,29 +250,34 @@ declare_class!(
+@@ -149,29 +258,34 @@ declare_class!(
          }
  
          #[method(touchesBegan:withEvent:)]
@@ -635,7 +724,7 @@ index 418968c..fd95139 100644
              let (phase, delta) = match recognizer.state() {
                  UIGestureRecognizerState::Began => {
                      self.ivars().pinch_last_delta.set(recognizer.scale());
-@@ -179,18 +285,16 @@ declare_class!(
+@@ -179,18 +293,16 @@ declare_class!(
                  }
                  UIGestureRecognizerState::Changed => {
                      let last_scale: f64 = self.ivars().pinch_last_delta.replace(recognizer.scale());
@@ -660,7 +749,7 @@ index 418968c..fd95139 100644
              };
  
              let gesture_event = EventWrapper::StaticEvent(Event::WindowEvent {
-@@ -321,6 +425,133 @@ declare_class!(
+@@ -321,10 +433,208 @@ declare_class!(
          fn can_become_first_responder(&self) -> bool {
              true
          }
@@ -687,6 +776,54 @@ index 418968c..fd95139 100644
 +                }
 +            }
 +            resigned
++        }
++
++        #[method(canPerformAction:withSender:)]
++        fn can_perform_action(&self, action: Sel, sender: Option<&AnyObject>) -> bool {
++            let ours = [sel!(cut:), sel!(copy:), sel!(paste:), sel!(selectAll:), sel!(toggleBoldface:), sel!(toggleItalics:), sel!(toggleUnderline:)];
++            // Only for the menu the app asked for: otherwise UIKit would also send a hardware
++            // Command+C here, which already arrives as a key event.
++            if self.ivars().edit_menu_up.get() && ours.contains(&action) {
++                true
++            } else {
++                let can: bool = unsafe { msg_send![super(self), canPerformAction: action, withSender: sender] };
++                can
++            }
++        }
++
++        #[method(cut:)]
++        fn cut(&self, _sender: Option<&AnyObject>) {
++            self.send_shortcut(ModifiersState::SUPER, KeyCode::KeyX, "x");
++        }
++
++        #[method(copy:)]
++        fn copy(&self, _sender: Option<&AnyObject>) {
++            self.send_shortcut(ModifiersState::SUPER, KeyCode::KeyC, "c");
++        }
++
++        #[method(paste:)]
++        fn paste(&self, _sender: Option<&AnyObject>) {
++            self.send_paste();
++        }
++
++        #[method(selectAll:)]
++        fn select_all(&self, _sender: Option<&AnyObject>) {
++            self.send_shortcut(ModifiersState::SUPER, KeyCode::KeyA, "a");
++        }
++
++        #[method(toggleBoldface:)]
++        fn toggle_boldface(&self, _sender: Option<&AnyObject>) {
++            self.send_shortcut(ModifiersState::SUPER, KeyCode::KeyB, "b");
++        }
++
++        #[method(toggleItalics:)]
++        fn toggle_italics(&self, _sender: Option<&AnyObject>) {
++            self.send_shortcut(ModifiersState::SUPER, KeyCode::KeyI, "i");
++        }
++
++        #[method(toggleUnderline:)]
++        fn toggle_underline(&self, _sender: Option<&AnyObject>) {
++            self.send_shortcut(ModifiersState::SUPER, KeyCode::KeyU, "u");
 +        }
 +
 +        #[method(reclaimFirstResponder)]
@@ -741,6 +878,7 @@ index 418968c..fd95139 100644
 +
 +        #[method(hoverGesture:)]
 +        fn hover_gesture(&self, recognizer: &UIHoverGestureRecognizer) {
++            super::set_last_input_touch(false);
 +            let location = unsafe { recognizer.locationInView(None) };
 +            let position = self.physical(location);
 +            self.sync_modifiers(input::flags_state(unsafe { recognizer.modifierFlags() }));
@@ -794,7 +932,33 @@ index 418968c..fd95139 100644
      }
  
      unsafe impl NSObjectProtocol for WinitView {}
-@@ -368,6 +599,32 @@ impl WinitView {
+ 
++    unsafe impl UIEditMenuInteractionDelegate for WinitView {
++        #[method_id(editMenuInteraction:menuForConfiguration:suggestedActions:)]
++        fn edit_menu_for(
++            &self,
++            _interaction: &UIEditMenuInteraction,
++            _configuration: &UIEditMenuConfiguration,
++            suggested: &NSArray<UIMenuElement>,
++        ) -> Option<Retained<UIMenu>> {
++            Some(self.edit_menu_items(suggested))
++        }
++
++        #[method(editMenuInteraction:targetRectForConfiguration:)]
++        fn edit_menu_target(&self, _interaction: &UIEditMenuInteraction, _configuration: &UIEditMenuConfiguration) -> CGRect {
++            self.ivars().edit_menu_rect.get()
++        }
++
++        #[method(editMenuInteraction:willDismissMenuForConfiguration:animator:)]
++        fn edit_menu_will_dismiss(&self, _interaction: &UIEditMenuInteraction, _configuration: &UIEditMenuConfiguration, _animator: &AnyObject) {
++            self.ivars().edit_menu_up.set(false);
++        }
++    }
++
+     unsafe impl UIGestureRecognizerDelegate for WinitView {
+         #[method(gestureRecognizer:shouldRecognizeSimultaneouslyWithGestureRecognizer:)]
+         fn should_recognize_simultaneously(&self, _gesture_recognizer: &UIGestureRecognizer, _other_gesture_recognizer: &UIGestureRecognizer) -> bool {
+@@ -368,6 +678,36 @@ impl WinitView {
              rotation_last_delta: Cell::new(0.0),
              pinch_last_delta: Cell::new(0.0),
              pan_last_delta: Cell::new(CGPoint { x: 0.0, y: 0.0 }),
@@ -824,10 +988,14 @@ index 418968c..fd95139 100644
 +            long_press: RefCell::new(None),
 +            tap_release: RefCell::new(None),
 +            pointer_leave: RefCell::new(None),
++
++            edit_menu: RefCell::new(None),
++            edit_menu_rect: Cell::new(CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: 0.0, height: 0.0 } }),
++            edit_menu_up: Cell::new(false),
          });
          let this: Retained<Self> = unsafe { msg_send_id![super(this), initWithFrame: frame] };
  
-@@ -377,9 +634,486 @@ impl WinitView {
+@@ -377,9 +717,598 @@ impl WinitView {
              this.setContentScaleFactor(scale_factor as _);
          }
  
@@ -966,6 +1134,89 @@ index 418968c..fd95139 100644
 +        }
 +    }
 +
++    /// A key shortcut as if typed: `mods` down, the key pressed and released, the modifiers back.
++    fn send_shortcut(&self, mods: ModifiersState, code: KeyCode, character: &str) {
++        self.send_key_with(mods, code, Key::Character(SmolStr::new(character)));
++    }
++
++    /// Paste as Shift+Insert: the window toolkit takes Command+V for its own clipboard, which iOS
++    /// doesn't give it, while the app reads the system pasteboard itself for Shift+Insert.
++    fn send_paste(&self) {
++        self.send_key_with(ModifiersState::SHIFT, KeyCode::Insert, Key::Named(NamedKey::Insert));
++    }
++
++    fn send_key_with(&self, mods: ModifiersState, code: KeyCode, key: Key) {
++        let before = self.ivars().modifiers.get();
++        let event = |state| {
++            key_input(KeyEvent {
++                physical_key: PhysicalKey::Code(code),
++                logical_key: key.clone(),
++                text: None,
++                location: KeyLocation::Standard,
++                state,
++                repeat: false,
++                platform_specific: KeyEventExtra {},
++            })
++        };
++        self.send([
++            WindowEvent::ModifiersChanged(mods.into()),
++            event(ElementState::Pressed),
++            event(ElementState::Released),
++            WindowEvent::ModifiersChanged(before.into()),
++        ]);
++    }
++
++    /// The system edit menu, pointing at `rect` (physical pixels).
++    pub(crate) fn show_edit_menu(&self, rect: (f64, f64, f64, f64)) {
++        let scale = self.contentScaleFactor() as f64;
++        let scale = if scale > 0.0 { scale } else { 1.0 };
++        let target = CGRect {
++            origin: CGPoint { x: (rect.0 / scale) as _, y: (rect.1 / scale) as _ },
++            size: CGSize { width: (rect.2 / scale) as _, height: (rect.3 / scale) as _ },
++        };
++        self.ivars().edit_menu_rect.set(target);
++        let mtm = MainThreadMarker::from(self);
++        let interaction = {
++            let mut menu = self.ivars().edit_menu.borrow_mut();
++            if menu.is_none() {
++                let interaction = unsafe {
++                    UIEditMenuInteraction::initWithDelegate(mtm.alloc(), Some(ProtocolObject::from_ref(self)))
++                };
++                unsafe { self.addInteraction(ProtocolObject::from_ref(&*interaction)) };
++                *menu = Some(interaction);
++            }
++            menu.clone()
++        };
++        let Some(interaction) = interaction else { return };
++        self.ivars().edit_menu_up.set(true);
++        // Below the selection when there is room: the app's own formatting bar sits above it.
++        let point = CGPoint { x: target.origin.x + target.size.width / 2.0, y: target.origin.y + target.size.height };
++        unsafe {
++            let configuration = UIEditMenuConfiguration::configurationWithIdentifier_sourcePoint(None, point, mtm);
++            configuration.setPreferredArrowDirection(objc2_ui_kit::UIEditMenuArrowDirection::Up);
++            interaction.presentEditMenuWithConfiguration(&configuration);
++        }
++    }
++
++    /// The menu: UIKit's own suggestions for the standard actions this view takes (Cut, Copy,
++    /// Paste, Select All and the Format items), then Font.
++    fn edit_menu_items(&self, suggested: &NSArray<UIMenuElement>) -> Retained<UIMenu> {
++        let mtm = MainThreadMarker::from(self);
++        let mut items: Vec<Retained<UIMenuElement>> = suggested.iter().map(|e| e.retain()).collect();
++        let weak = Weak::from_retained(&self.retain());
++        let handler = RcBlock::new(move |_action: NonNull<UIAction>| {
++            if let Some(view) = weak.load() {
++                view.send_shortcut(ModifiersState::SUPER, KeyCode::KeyD, "d");
++            }
++        });
++        let font = unsafe {
++            let handler: *mut block2::Block<dyn Fn(NonNull<UIAction>)> = &*handler as *const _ as *mut _;
++            UIAction::actionWithTitle_image_identifier_handler(&NSString::from_str("Font…"), None, None, handler, mtm)
++        };
++        items.push(Retained::into_super(font));
++        unsafe { UIMenu::menuWithChildren(&NSArray::from_vec(items), mtm) }
++    }
++
 +    /// One finger on the screen: a tap clicks, a drag scrolls (and glides on), and a long press
 +    /// then drag is a mouse drag (it selects text). A second finger ends it: two fingers pinch.
 +    fn handle_finger(&self, touch: &UITouch) {
@@ -974,14 +1225,23 @@ index 418968c..fd95139 100644
 +        let time = touch.timestamp();
 +        match touch.phase() {
 +            UITouchPhase::Began => {
++                super::set_last_input_touch(true);
 +                self.flush_tap_release();
 +                Self::cancel(&self.ivars().pointer_leave);
 +                self.ensure_first_responder();
 +                self.ivars().fingers_down.borrow_mut().push(id);
 +                if self.ivars().fingers_down.borrow().len() == 1 {
-+                    self.ivars().finger.replace(Some(Finger { id, start: at, last: at, mode: FingerMode::Pending, samples: vec![(time, at)] }));
-+                    let timer = self.after(LONG_PRESS, |view| view.long_press());
-+                    self.ivars().long_press.replace(Some(timer));
++                    let p = self.physical(at);
++                    // On a handle the app drew for a finger: a drag at once, not a scroll.
++                    let grabbed = super::in_touch_grab_region(p.x, p.y);
++                    let mode = if grabbed { FingerMode::Pressing } else { FingerMode::Pending };
++                    self.ivars().finger.replace(Some(Finger { id, start: at, last: at, mode, samples: vec![(time, at)] }));
++                    if grabbed {
++                        self.send([WindowEvent::CursorEntered { device_id: DEVICE_ID }, WindowEvent::CursorMoved { device_id: DEVICE_ID, position: p }, self.mouse(ElementState::Pressed)]);
++                    } else {
++                        let timer = self.after(LONG_PRESS, |view| view.long_press());
++                        self.ivars().long_press.replace(Some(timer));
++                    }
 +                } else {
 +                    self.end_finger(at, false);
 +                }
@@ -998,9 +1258,17 @@ index 418968c..fd95139 100644
 +                if mode == FingerMode::Pending && moved_far {
 +                    f.mode = FingerMode::Scrolling;
 +                    let (sx, sy) = (at.x - f.start.x, at.y - f.start.y);
++                    let start = f.start;
 +                    drop(finger);
 +                    Self::cancel(&self.ivars().long_press);
-+                    self.send([self.wheel(0.0, 0.0, TouchPhase::Started), self.wheel(sx as f64, sy as f64, TouchPhase::Moved)]);
++                    // The scroll goes to what is under the finger (a list, a pane, the page): the
++                    // pointer goes there first.
++                    self.send([
++                        WindowEvent::CursorEntered { device_id: DEVICE_ID },
++                        WindowEvent::CursorMoved { device_id: DEVICE_ID, position: self.physical(start) },
++                        self.wheel(0.0, 0.0, TouchPhase::Started),
++                        self.wheel(sx as f64, sy as f64, TouchPhase::Moved),
++                    ]);
 +                    return;
 +                }
 +                drop(finger);
@@ -1051,6 +1319,13 @@ index 418968c..fd95139 100644
 +            FingerMode::Pending => {}
 +            FingerMode::Scrolling => {
 +                self.send([self.wheel(0.0, 0.0, TouchPhase::Ended)]);
++                let leave = self.after(TAP_POINTER_LEAVE, |view| {
++                    view.ivars().pointer_leave.take();
++                    if view.ivars().fingers_down.borrow().is_empty() {
++                        view.send([WindowEvent::CursorLeft { device_id: DEVICE_ID }]);
++                    }
++                });
++                self.ivars().pointer_leave.replace(Some(leave));
 +                if lifted {
 +                    let velocity = match (finger.samples.first(), finger.samples.last()) {
 +                        (Some((t0, p0)), Some((t1, p1))) if t1 - t0 > 0.005 => {
@@ -1245,6 +1520,11 @@ index 418968c..fd95139 100644
 +                repeat: false,
 +                platform_specific: KeyEventExtra {},
 +            };
++            if pressed && code == KeyCode::KeyV && flags == ModifiersState::SUPER {
++                self.ivars().held_keys.borrow_mut().push(code);
++                self.send_paste();
++                continue;
++            }
 +            if pressed {
 +                self.cancel_text_key(code);
 +                let mut held = self.ivars().held_keys.borrow_mut();
@@ -1314,7 +1594,7 @@ index 418968c..fd95139 100644
      fn window(&self) -> Option<Retained<WinitUIWindow>> {
          // SAFETY: `WinitView`s are always installed in a `WinitUIWindow`
          (**self).window().map(|window| unsafe { Retained::cast(window) })
-@@ -474,13 +1208,49 @@ impl WinitView {
+@@ -474,13 +1403,50 @@ impl WinitView {
          }
      }
  
@@ -1337,6 +1617,7 @@ index 418968c..fd95139 100644
 +            // A trackpad or mouse click (`UIApplicationSupportsIndirectInputEvents`), or Apple
 +            // Pencil: mouse buttons at the pointer, so the pencil selects as it moves.
 +            if touch_type == UITouchType::IndirectPointer || touch_type == UITouchType::Pencil {
++                super::set_last_input_touch(false);
 +                let window_id = RootWindowId(window.id());
 +                let position = self.physical(logical_location);
 +                let touch_id = touch as *const UITouch as u64;
@@ -1365,7 +1646,7 @@ index 418968c..fd95139 100644
              let force = if os_supports_force {
                  let trait_collection = self.traitCollection();
                  let touch_capability = trait_collection.forceTouchCapability();
-@@ -544,6 +1314,17 @@ impl WinitView {
+@@ -544,6 +1510,17 @@ impl WinitView {
          let window = self.window().unwrap();
          let window_id = RootWindowId(window.id());
          let mtm = MainThreadMarker::new().unwrap();
@@ -1383,7 +1664,7 @@ index 418968c..fd95139 100644
          // send individual events for each character
          app_state::handle_nonuser_events(
              mtm,
-@@ -579,6 +1360,64 @@ impl WinitView {
+@@ -579,6 +1556,64 @@ impl WinitView {
      }
  
      fn handle_delete_backward(&self) {
@@ -1448,7 +1729,7 @@ index 418968c..fd95139 100644
          let window = self.window().unwrap();
          let window_id = RootWindowId(window.id());
          let mtm = MainThreadMarker::new().unwrap();
-@@ -605,3 +1444,13 @@ impl WinitView {
+@@ -605,3 +1640,13 @@ impl WinitView {
          );
      }
  }

@@ -78,6 +78,8 @@ impl App {
     /// One frame's logic: what the OS asked, the app, its file dialogs, then the root window's close
     /// path. Without `frame` (a test over no window) the dialogs have no parent window.
     fn logic_pass(&mut self, ctx: &egui::Context, frame: Option<&eframe::Frame>) {
+        #[cfg(target_os = "ios")]
+        self.app.set_touch_input(ios::last_input_was_touch());
         self.app.logic(ctx);
         self.panels.pump_with(self.app.dialog_host_mut(), frame);
         // A quit that waits for nothing (the documents are answered for) closes the root window.
@@ -96,6 +98,8 @@ impl App {
         }
         self.app.ui(ui);
         self.panels.pump_with(self.app.dialog_host_mut(), frame);
+        #[cfg(target_os = "ios")]
+        ios::touch_overlay(ui.ctx(), self.app.take_touch_overlay());
     }
 
     /// Everything that must happen before the process ends, whichever way the window closes.
@@ -699,6 +703,9 @@ fn main() -> eframe::Result {
             let mut app = WordApp::new(session, services(spool.clone(), intake, nightly)).with_host(host).with_settings(settings.clone());
             // PLAN: writer note 9 puts `with_settings` after `with_control`; it comes first here because
             // the region check below reads the saved region the settings apply.
+            // iPadOS: selection handles for a finger, and the system edit menu over a touch's selection.
+            #[cfg(target_os = "ios")]
+            app.set_touch_selection(true);
             if std::env::var("WORDCRAFT_FILE_DIALOG").is_ok_and(|v| v.trim().eq_ignore_ascii_case("builtin")) {
                 app = app.with_fallback_chooser(true);
             }

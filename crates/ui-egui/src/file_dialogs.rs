@@ -92,6 +92,47 @@ pub(crate) struct PendingDialog {
     after: AfterPick,
 }
 
+/// iPadOS: the picker's copy of a document, moved into the app's `Documents` folder (On My iPad ›
+/// WordCraft in the Files app). A file of the same name and bytes already there is opened instead
+/// of a second copy; a different one keeps both, the new one as "Name 2". If the move fails the
+/// copy opens where the picker left it.
+#[cfg(target_os = "ios")]
+fn ios_import(picked: &std::path::Path) -> std::path::PathBuf {
+    let Some(documents) = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Documents")) else { return picked.into() };
+    if picked.starts_with(&documents) {
+        return picked.into();
+    }
+    let (Some(stem), ext) =
+        (picked.file_stem().map(|s| s.to_string_lossy().into_owned()), picked.extension().map(|e| e.to_string_lossy().into_owned()))
+    else {
+        return picked.into();
+    };
+    let named = |n: u32| {
+        let stem = if n == 1 { stem.clone() } else { format!("{stem} {n}") };
+        documents.join(match &ext {
+            Some(ext) => format!("{stem}.{ext}"),
+            None => stem,
+        })
+    };
+    let bytes = std::fs::read(picked).ok();
+    for n in 1..1000 {
+        let target = named(n);
+        if target.exists() {
+            if bytes.is_some() && std::fs::read(&target).ok() == bytes {
+                let _ = std::fs::remove_file(picked);
+                return target;
+            }
+            continue;
+        }
+        if std::fs::create_dir_all(&documents).is_ok() && std::fs::copy(picked, &target).is_ok() {
+            let _ = std::fs::remove_file(picked);
+            return target;
+        }
+        break;
+    }
+    picked.into()
+}
+
 /// How asking for a file went.
 pub(crate) enum Asked {
     /// Another file dialog is still open; nothing happened.
@@ -169,6 +210,11 @@ impl WordApp {
                 Some(self.finish_pick(d.after, None))
             }
             Picked::Paths(paths) => {
+                // iPadOS imports a copy of a picked document: it goes in the app's own folder, so
+                // Save writes where the Files app shows it.
+                #[cfg(target_os = "ios")]
+                let paths: Vec<std::path::PathBuf> =
+                    if matches!(d.after, AfterPick::OpenDocument { .. }) { paths.iter().map(|p| ios_import(p)).collect() } else { paths };
                 let paths = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
                 Some(self.finish_picks(d.after, paths))
             }

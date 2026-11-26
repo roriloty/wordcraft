@@ -195,6 +195,8 @@ pub struct CanvasState {
     /// The selection the mini toolbar was put away for by a click outside the document (the
     /// ribbon, a pane, the status bar); it comes back when the selection changes.
     pub mini_dismissed: Option<wordcraft_engine::Selection>,
+    /// Touch selection: the handles a finger drags and the edit menu it gets (`touch_selection`).
+    pub(crate) touch: crate::touch_selection::TouchState,
     /// Crop mode (Picture Format › Crop) is on for the picture here (`crop`).
     pub(crate) crop: Option<wordcraft_doc::Pos>,
     /// An ink stroke being drawn with a pen (Draw tab).
@@ -429,6 +431,7 @@ impl Default for CanvasState {
             context_menu_at: None,
             mini_anchor: None,
             mini_dismissed: None,
+            touch: Default::default(),
             crop: None,
             ink: None,
             erasing: None,
@@ -831,6 +834,8 @@ fn show_pages(app: &mut WordApp, ui: &mut Ui, layout: &Arc<DocLayout>, full: Rec
             // Shown after the selection areas: across controls the later one is on top of a press, and a border
             // beats the area it lies in (the engine's `target_at` answers none where a border is).
             crate::table_mouse::show(app, ui, layout, body);
+            // A finger's selection handles, over the text and tables they lie on.
+            crate::touch_selection::show(app, ui, layout, body, &selected);
             crate::table_resize::show(app, ui, layout, body);
             crate::ink::show(app, ui, layout, body);
             crate::dialogs_smart_art::frame_button(app, ui, body.pages, layout);

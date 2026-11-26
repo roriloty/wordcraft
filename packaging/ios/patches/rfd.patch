@@ -60,14 +60,14 @@ index a4edf24..f237035 100755
  #[cfg(target_os = "windows")]
 diff --git a/src/backend/ios.rs b/src/backend/ios.rs
 new file mode 100644
-index 0000000..090aaf9
+index 0000000..da00672
 --- /dev/null
 +++ b/src/backend/ios.rs
-@@ -0,0 +1,305 @@
+@@ -0,0 +1,315 @@
 +//! iOS and iPadOS: UIKit's document picker, the one the Files app shows.
 +//!
-+//! - Open: the picked documents in place (not copies), with their security scope held for the
-+//!   rest of the process, so the app can save back to them.
++//! - Open: copies of the picked documents, in the app's temporary folder (the picker's import
++//!   mode, which every file provider supports; opening in place is not offered by all of them).
 +//! - Save: an empty file of the suggested name is exported (moved) to the place the person picks,
 +//!   where the system handles names already taken; the app then writes the document over it.
 +//! - Folder: the picked folder, in place.
@@ -173,6 +173,9 @@ index 0000000..090aaf9
 +thread_local! {
 +    /// The pickers on screen: UIKit holds its delegate weakly.
 +    static ACTIVE: RefCell<Vec<Retained<PickerDelegate>>> = const { RefCell::new(Vec::new()) };
++    /// Pickers that have answered, kept until the next picker opens: the last one answered from
++    /// inside its own delegate call, which must not free it.
++    static DONE: RefCell<Vec<Retained<PickerDelegate>>> = const { RefCell::new(Vec::new()) };
 +}
 +
 +impl PickerDelegate {
@@ -181,7 +184,13 @@ index 0000000..090aaf9
 +            let _ = sender.send(answer);
 +        }
 +        self.ivars().picker.take();
-+        ACTIVE.with(|active| active.borrow_mut().retain(|d| !std::ptr::eq(&**d, self)));
++        ACTIVE.with(|active| {
++            let mut active = active.borrow_mut();
++            if let Some(at) = active.iter().position(|d| std::ptr::eq(&**d, self)) {
++                let done = active.remove(at);
++                DONE.with(|d| d.borrow_mut().push(done));
++            }
++        });
 +    }
 +}
 +
@@ -245,13 +254,14 @@ index 0000000..090aaf9
 +        let _ = sender.send(None);
 +        return receiver;
 +    };
++    DONE.with(|d| d.borrow_mut().clear());
 +    let mut placeholder_path = None;
 +    let picker = match mode {
 +        Mode::Open { multiple } => {
 +            let picker = UIDocumentPickerViewController::initForOpeningContentTypes_asCopy(
 +                UIDocumentPickerViewController::alloc(mtm),
 +                &content_types(&dialog),
-+                false,
++                true,
 +            );
 +            picker.setAllowsMultipleSelection(multiple);
 +            picker
